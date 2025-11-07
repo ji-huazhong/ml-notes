@@ -198,6 +198,7 @@ def main(args):
             output_dir=args.memory_profiling_dir,
             enabled=True,
             rank=rank,
+            enabled_ranks=args.memory_profiling_ranks,
             dump_on_enter=False,
             dump_on_exit=True
         )
@@ -220,7 +221,7 @@ def main(args):
         num_batches = 0
         
         # Profile epoch if enabled
-        epoch_ctx = profiler.profile(f"epoch_{epoch + 1}", step=None) if profiler else null_context()
+        epoch_ctx = profiler.profile(step=None) if profiler else null_context()
         with epoch_ctx:
             for batch_idx, (inputs, labels) in enumerate(train_loader):
                 # Set current step for profiler (useful for decorator mode)
@@ -228,7 +229,7 @@ def main(args):
                     profiler.set_step(global_step)
                 
                 # Profile batch if enabled (only at log intervals to avoid too many snapshots)
-                batch_ctx = (profiler.profile(f"epoch_{epoch + 1}_batch_{batch_idx}", step=global_step) 
+                batch_ctx = (profiler.profile(step=global_step) 
                             if (profiler and batch_idx % args.log_interval == 0) 
                             else null_context())
                 
@@ -309,7 +310,17 @@ if __name__ == '__main__':
                         help='Enable CUDA memory profiling with history recording and snapshots')
     parser.add_argument('--memory_profiling_dir', type=str, default='memory_snapshots',
                         help='Directory to save memory snapshots')
+    parser.add_argument('--memory_profiling_ranks', type=str, default='0',
+                        help='Comma-separated list of ranks to dump snapshots (e.g., "0,1,2" or "0"). Default: "0"')
     
     args = parser.parse_args()
+    
+    # Parse memory_profiling_ranks from string to list of integers
+    if args.enable_memory_profiling:
+        try:
+            args.memory_profiling_ranks = [int(r.strip()) for r in args.memory_profiling_ranks.split(',')]
+        except ValueError:
+            raise ValueError(f'Invalid memory_profiling_ranks format: {args.memory_profiling_ranks}. '
+                           f'Expected comma-separated integers (e.g., "0,1,2").')
 
     main(args)

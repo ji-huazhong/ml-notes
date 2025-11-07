@@ -48,6 +48,7 @@ class MemoryProfiler:
                  output_dir: str = "memory_snapshots",
                  enabled: bool = True,
                  rank: int = 0,
+                 enabled_ranks: Optional[list] = None,
                  dump_on_enter: bool = False,
                  dump_on_exit: bool = True):
         """
@@ -56,20 +57,22 @@ class MemoryProfiler:
         Args:
             output_dir: Directory to save memory snapshots
             enabled: Whether profiling is enabled
-            rank: Process rank (only rank 0 will dump by default)
+            rank: Process rank
+            enabled_ranks: List of ranks to dump snapshots. Default is [0] (only rank 0).
             dump_on_enter: Whether to dump snapshot when entering context/decorator
             dump_on_exit: Whether to dump snapshot when exiting context/decorator
         """
         self.output_dir = Path(output_dir)
         self.enabled = enabled
         self.rank = rank
+        self.enabled_ranks = enabled_ranks if enabled_ranks is not None else [0]
         self.dump_on_enter = dump_on_enter
         self.dump_on_exit = dump_on_exit
         self._recording = False
         self._snapshot_counter = 0
         self._current_step = None
         
-        if self.enabled and self.rank == 0:
+        if self.enabled and self.rank in self.enabled_ranks:
             self.output_dir.mkdir(parents=True, exist_ok=True)
     
     def _generate_filename(self, step: Optional[int] = None, suffix: Optional[str] = None) -> str:
@@ -97,25 +100,25 @@ class MemoryProfiler:
     
     def start_recording(self):
         """Start recording CUDA memory history."""
-        if self.enabled and self.rank == 0 and not self._recording:
+        if self.enabled and self.rank in self.enabled_ranks and not self._recording:
             torch.cuda.memory._record_memory_history(
                 max_entries=200000,
                 context="all",
                 stacks="all",
             )
             self._recording = True
-            if self.rank == 0:
-                print(f'[MemoryProfiler] Started recording memory history')
+            if self.rank in self.enabled_ranks:
+                print(f'[MemoryProfiler] Rank {self.rank}: Started recording memory history')
     
     def stop_recording(self):
         """Stop recording CUDA memory history."""
-        if self.enabled and self.rank == 0 and self._recording:
+        if self.enabled and self.rank in self.enabled_ranks and self._recording:
             torch.cuda.memory._record_memory_history(enabled=None)
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
             self._recording = False
-            if self.rank == 0:
-                print(f'[MemoryProfiler] Stopped recording memory history')
+            if self.rank in self.enabled_ranks:
+                print(f'[MemoryProfiler] Rank {self.rank}: Stopped recording memory history')
     
     def dump_snapshot(self, name: Optional[str] = None, step: Optional[int] = None) -> Optional[str]:
         """
@@ -128,7 +131,7 @@ class MemoryProfiler:
         Returns:
             Path to the snapshot file if dumped, None otherwise.
         """
-        if not self.enabled or self.rank != 0:
+        if not self.enabled or self.rank not in self.enabled_ranks:
             return None
         
         if name is None:
@@ -140,12 +143,12 @@ class MemoryProfiler:
         try:
             torch.cuda.synchronize()
             torch.cuda.memory._dump_snapshot(str(snapshot_path))
-            if self.rank == 0:
-                print(f'[MemoryProfiler] Snapshot saved: {snapshot_path}')
+            if self.rank in self.enabled_ranks:
+                print(f'[MemoryProfiler] Rank {self.rank}: Snapshot saved: {snapshot_path}')
             return str(snapshot_path)
         except Exception as e:
-            if self.rank == 0:
-                print(f'[MemoryProfiler] Failed to dump snapshot: {e}')
+            if self.rank in self.enabled_ranks:
+                print(f'[MemoryProfiler] Rank {self.rank}: Failed to dump snapshot: {e}')
             return None
     
     @contextmanager
@@ -165,7 +168,7 @@ class MemoryProfiler:
             if snapshot_name:
                 name = self._generate_filename(step=step, suffix=f"{snapshot_name}_enter")
             else:
-                name = self._generate_filename(step=step, suffix="enter")
+                name = self._generate_filename(step=step, suffix=None)
             self.dump_snapshot(name, step=step)
         
         try:
@@ -177,7 +180,7 @@ class MemoryProfiler:
                 if snapshot_name:
                     name = self._generate_filename(step=exit_step, suffix=f"{snapshot_name}_exit")
                 else:
-                    name = self._generate_filename(step=exit_step, suffix="exit")
+                    name = self._generate_filename(step=exit_step, suffix=None)
                 self.dump_snapshot(name, step=exit_step)
     
     def profile_decorator(self, snapshot_name: Optional[str] = None):
@@ -229,4 +232,3 @@ class MemoryProfiler:
             self.dump_snapshot(name, step=self._current_step)
         self.stop_recording()
         return False
-

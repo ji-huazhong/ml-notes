@@ -22,33 +22,34 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 import argparse
 
-from model import TransformerBlock, DemoModel
+from model import SimpleLinearModel
 from profiler import MemoryProfiler, null_context
 
 
 class SyntheticDataset(Dataset):
     """Synthetic dataset for demonstration"""
-    def __init__(self, num_samples=10000, vocab_size=10000, seq_len=128):
+    def __init__(self, num_samples=10000, vocab_size=10000, seq_len=128, hidden_size=512):
         self.num_samples = num_samples
         self.vocab_size = vocab_size
         self.seq_len = seq_len
+        self.hidden_size = hidden_size
         
     def __len__(self):
         return self.num_samples
     
     def __getitem__(self, idx):
-        # Generate random input sequence
-        input_ids = torch.randint(0, self.vocab_size, (self.seq_len,))
-        # Generate labels for each position (for language modeling, label is next token)
+        # 生成随机输入特征 (seq_len, hidden_size)
+        # 使用正态分布生成，模拟embedding后的特征
+        inputs = torch.randn(self.seq_len, self.hidden_size)
+        # 生成标签：每个位置对应一个类别 (vocab_size个类别)
         labels = torch.randint(0, self.vocab_size, (self.seq_len,))
-        return input_ids, labels
+        return inputs, labels
 
 
 def setup_distributed():
@@ -87,10 +88,10 @@ def cleanup_distributed():
 
 def get_fsdp_model(model, device, args):
     """Wrap model with FSDP"""
-    # Auto-wrap policy for transformer blocks
+    # 使用size_based策略：当参数数量超过min_num_params时自动wrap
     auto_wrap_policy = partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={TransformerBlock}
+        size_based_auto_wrap_policy,
+        min_num_params=1000  # 可以根据需要调整
     )
     
     # Sharding strategy
@@ -141,15 +142,13 @@ def main(args):
         print(f'Device: {device}')
         print(f'Sharding strategy: {args.sharding_strategy}')
         print(f'Precision: FP32')
+        print(f'Model type: Simple 4-Layer Linear Model')
     
-    # Create model
-    model = DemoModel(
-        vocab_size=args.vocab_size,
+    # Create simple 4-layer Linear model
+    model = SimpleLinearModel(
+        input_size=args.hidden_size,  # 使用hidden_size作为输入维度
         hidden_size=args.hidden_size,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        intermediate_size=args.intermediate_size,
-        max_seq_len=args.seq_len
+        output_size=args.vocab_size
     )
     
     # Move model to device and wrap with FSDP
@@ -162,12 +161,18 @@ def main(args):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f'Total parameters: {total_params:,}')
         print(f'Trainable parameters: {trainable_params:,}')
+        print(f'Model structure:')
+        print(f'  Input size: {args.hidden_size}')
+        print(f'  Hidden size: {args.hidden_size}')
+        print(f'  Output size: {args.vocab_size}')
+        print(f'  Layers: 4 Linear layers with ReLU activation')
     
     # Create dataset and dataloader
     train_dataset = SyntheticDataset(
         num_samples=args.num_samples,
         vocab_size=args.vocab_size,
-        seq_len=args.seq_len
+        seq_len=args.seq_len,
+        hidden_size=args.hidden_size  # 添加hidden_size参数
     )
     
     # Use DistributedSampler for multi-GPU training
@@ -198,6 +203,7 @@ def main(args):
             output_dir=args.memory_profiling_dir,
             enabled=True,
             rank=rank,
+            enabled_ranks=args.memory_profiling_ranks,
             dump_on_enter=False,
             dump_on_exit=True
         )
@@ -220,7 +226,7 @@ def main(args):
         num_batches = 0
         
         # Profile epoch if enabled
-        epoch_ctx = profiler.profile(f"epoch_{epoch + 1}", step=None) if profiler else null_context()
+        epoch_ctx = profiler.profile(step=None) if profiler else null_context()
         with epoch_ctx:
             for batch_idx, (inputs, labels) in enumerate(train_loader):
                 # Set current step for profiler (useful for decorator mode)
@@ -228,7 +234,7 @@ def main(args):
                     profiler.set_step(global_step)
                 
                 # Profile batch if enabled (only at log intervals to avoid too many snapshots)
-                batch_ctx = (profiler.profile(f"epoch_{epoch + 1}_batch_{batch_idx}", step=global_step) 
+                batch_ctx = (profiler.profile(step=global_step) 
                             if (profiler and batch_idx % args.log_interval == 0) 
                             else null_context())
                 
@@ -291,11 +297,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
     parser.add_argument('--epochs', type=int, default=1, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--vocab_size', type=int, default=10000, help='Vocabulary size')
+    parser.add_argument('--vocab_size', type=int, default=10000, help='Output vocabulary size')
     parser.add_argument('--hidden_size', type=int, default=512, help='Hidden size')
-    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--num_layers', type=int, default=1, help='Number of transformer layers')
-    parser.add_argument('--intermediate_size', type=int, default=2048, help='Intermediate size')
     parser.add_argument('--seq_len', type=int, default=128, help='Sequence length')
     parser.add_argument('--num_samples', type=int, default=256, help='Number of training samples')
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
@@ -309,7 +312,17 @@ if __name__ == '__main__':
                         help='Enable CUDA memory profiling with history recording and snapshots')
     parser.add_argument('--memory_profiling_dir', type=str, default='memory_snapshots',
                         help='Directory to save memory snapshots')
+    parser.add_argument('--memory_profiling_ranks', type=str, default='0',
+                        help='Comma-separated list of ranks to dump snapshots (e.g., "0,1,2" or "0"). Default: "0"')
     
     args = parser.parse_args()
+    
+    # Parse memory_profiling_ranks from string to list of integers
+    if args.enable_memory_profiling:
+        try:
+            args.memory_profiling_ranks = [int(r.strip()) for r in args.memory_profiling_ranks.split(',')]
+        except ValueError:
+            raise ValueError(f'Invalid memory_profiling_ranks format: {args.memory_profiling_ranks}. '
+                           f'Expected comma-separated integers (e.g., "0,1,2").')
 
     main(args)

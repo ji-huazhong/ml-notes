@@ -30,6 +30,7 @@ from functools import partial
 import argparse
 
 from model import TransformerBlock, DemoModel
+from profiler import MemoryProfiler, null_context
 
 
 class SyntheticDataset(Dataset):
@@ -113,33 +114,21 @@ def get_fsdp_model(model, device, args):
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, rank, args):
-    """Train for one epoch"""
-    model.train()
-    total_loss = 0.0
-    num_batches = 0
+def train_step(model, inputs, labels, optimizer, criterion, device):
+    """Train for one step (one batch)"""
+    inputs = inputs.to(device)
+    labels = labels.to(device)
     
-    for batch_idx, (inputs, labels) in enumerate(dataloader):
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(inputs)  # (batch_size, seq_len, vocab_size)
-        # Reshape for CrossEntropyLoss: (batch_size * seq_len, vocab_size) and (batch_size * seq_len,)
-        outputs = outputs.reshape(-1, outputs.size(-1))
-        labels = labels.reshape(-1)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-        
-        if rank == 0 and batch_idx % args.log_interval == 0:
-            print(f'Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}')
+    optimizer.zero_grad()
+    outputs = model(inputs)  # (batch_size, seq_len, vocab_size)
+    # Reshape for CrossEntropyLoss: (batch_size * seq_len, vocab_size) and (batch_size * seq_len,)
+    outputs = outputs.reshape(-1, outputs.size(-1))
+    labels = labels.reshape(-1)
+    loss = criterion(outputs, labels)
+    loss.backward()
+    optimizer.step()
     
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    return avg_loss
+    return loss.item()
 
 
 def main(args):
@@ -202,10 +191,24 @@ def main(args):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Initialize memory profiler if enabled
+    profiler = None
+    if args.enable_memory_profiling:
+        profiler = MemoryProfiler(
+            output_dir=args.memory_profiling_dir,
+            enabled=True,
+            rank=rank,
+            dump_on_enter=False,
+            dump_on_exit=True
+        )
+        profiler.start_recording()
+    
     # Training loop
+    model.train()
     if rank == 0:
         print('\nStarting training...\n')
     
+    global_step = 0
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -213,10 +216,43 @@ def main(args):
         if rank == 0:
             print(f'Epoch {epoch + 1}/{args.epochs}')
         
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, rank, args)
+        epoch_loss = 0.0
+        num_batches = 0
         
+        # Profile epoch if enabled
+        epoch_ctx = profiler.profile(f"epoch_{epoch + 1}", step=None) if profiler else null_context()
+        with epoch_ctx:
+            for batch_idx, (inputs, labels) in enumerate(train_loader):
+                # Set current step for profiler (useful for decorator mode)
+                if profiler is not None:
+                    profiler.set_step(global_step)
+                
+                # Profile batch if enabled (only at log intervals to avoid too many snapshots)
+                batch_ctx = (profiler.profile(f"epoch_{epoch + 1}_batch_{batch_idx}", step=global_step) 
+                            if (profiler and batch_idx % args.log_interval == 0) 
+                            else null_context())
+                
+                with batch_ctx:
+                    # Train step
+                    loss_value = train_step(model, inputs, labels, optimizer, criterion, device)
+                    
+                    epoch_loss += loss_value
+                    num_batches += 1
+                    global_step += 1
+                    
+                    # Logging
+                    if rank == 0 and batch_idx % args.log_interval == 0:
+                        print(f'Step {global_step}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss_value:.4f}')
+            
+            # Update epoch profile with final step (for exit dump)
+            if profiler is not None:
+                # Use the last completed step (global_step - 1) for epoch exit dump
+                profiler.set_step(global_step - 1 if global_step > 0 else 0)
+        
+        # Epoch summary
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
         if rank == 0:
-            print(f'Epoch {epoch + 1} - Train Loss: {train_loss:.4f}\n')
+            print(f'Epoch {epoch + 1} - Train Loss: {avg_loss:.4f}\n')
     
     # Save model
     if args.save_model and rank == 0:
@@ -231,6 +267,17 @@ def main(args):
                 'args': args,
             }, save_path)
         print(f'Model saved to {save_path}')
+    
+    # Stop profiler
+    if profiler is not None:
+        # Use the last step for final snapshot
+        final_step = global_step - 1 if global_step > 0 else 0
+        profiler.set_step(final_step)
+        profiler.dump_snapshot(step=final_step)
+        profiler.stop_recording()
+        if rank == 0:
+            print(f'\n[MemoryProfiler] All snapshots saved to: {profiler.output_dir}')
+            print('[MemoryProfiler] To visualize snapshots, use torch.cuda.memory._dump_snapshot() or other visualization tools')
     
     # Cleanup
     cleanup_distributed()
@@ -250,12 +297,18 @@ if __name__ == '__main__':
     parser.add_argument('--num_layers', type=int, default=1, help='Number of transformer layers')
     parser.add_argument('--intermediate_size', type=int, default=2048, help='Intermediate size')
     parser.add_argument('--seq_len', type=int, default=128, help='Sequence length')
-    parser.add_argument('--num_samples', type=int, default=512, help='Number of training samples')
+    parser.add_argument('--num_samples', type=int, default=256, help='Number of training samples')
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
                         choices=['full_shard', 'shard_grad_op', 'no_shard'],
                         help='FSDP sharding strategy')
     parser.add_argument('--log_interval', type=int, default=1, help='Log interval')
     parser.add_argument('--save_model', action='store_true', help='Save model checkpoint')
+    
+    # Memory profiling arguments
+    parser.add_argument('--enable_memory_profiling', action='store_true',
+                        help='Enable CUDA memory profiling with history recording and snapshots')
+    parser.add_argument('--memory_profiling_dir', type=str, default='memory_snapshots',
+                        help='Directory to save memory snapshots')
     
     args = parser.parse_args()
 

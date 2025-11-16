@@ -17,14 +17,13 @@ NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/nu
 
 if [ "$NUM_GPUS" -eq "0" ]; then
     echo "单 GPU 或 CPU 模式"
-    python3 fsdp_fp32.py --epochs 2 --batch_size 16
+    python3 fsdp_fp32.py --total_steps 50 --batch_size 16
 elif [ "$NUM_GPUS" -eq "1" ]; then
     echo "单 GPU 模式"
-    python3 fsdp_fp32.py --epochs 2 --batch_size 32
+    python3 fsdp_fp32.py --total_steps 100 --batch_size 4
 else
     echo "多 GPU 模式 (${NUM_GPUS} GPUs)"
     torchrun --nproc_per_node=${NUM_GPUS} fsdp_fp32.py \
-        --epochs 2 \
-        --batch_size 32 \
-        --log_interval 5
+        --total_steps 200 \
+        --batch_size 32
 fi
